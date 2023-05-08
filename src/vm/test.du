@@ -1,0 +1,6 @@
+for (var i = 0; i < 10; i += 1) {
+    if (i > 5)
+        break; // Exit the loop here
+
+    print(i); // Only numbers less than or equal to 5 will be printed
+}

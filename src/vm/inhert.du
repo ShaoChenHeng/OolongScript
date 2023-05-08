@@ -1,0 +1,19 @@
+class BaseClass {
+    init() {
+        this.someVariable = "Hello!";
+    }
+
+    printMessage(message) {
+        print(message);
+    }
+}
+
+class NewClass < BaseClass {
+    init() {
+        super.init();
+    }
+}
+
+var obj = NewClass();
+obj.printMessage("Hello!"); // Hello!
+print(obj.someVariable); // Hello!

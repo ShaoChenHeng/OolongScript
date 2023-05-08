@@ -1,0 +1,60 @@
+var a;
+a
+a;
+a = 1;
+var b = 1;
+var a = 1;
+var a = 1
+var a = 1;
+var a;
+a = 1;
+var a = 1;
+print("hello");
+print("1");
+var a = 1;
+print("1");
+var a = 1;
+print("1");
+var a = 1;
+var a = a;
+var a = 1;
+print(a)
+print(a);
+a
+a = 1 + 2;
+print(1);
+input();
+var b = 0;
+while (b < 10) {b = b + 1;}
+print(1);
+print(1)
+print(1);
+print("help");
+print(1);
+print("Hello World!");
+print(1);
+var a = 1;
+print(a)
+print(a);
+a = 2;
+print(a);
+var b = 3;
+var c = 5;
+a = b + c;
+print(a)
+print(a);
+a += 1;
+while (a < 15) {print("hello"); a ++;}
+while (a < 15) {print("hello"); a += 1;}
+for (var i = 0; i < 10; i += 1) {
+print("hello");
+}
+var a = "123";
+a[0];
+var b = "hello";
+b.lowe();
+b.lower();
+print(b);
+print(b.lower());
+print(b.upper());
+print(5 % 3);
