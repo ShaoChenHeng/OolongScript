@@ -92,13 +92,14 @@ bool resolvePath(char *directory, char *path, char *ret) {
 ObjString *getDirectory(DictuVM *vm, char *source) {
     // Slight workaround to ensure only .du files are the ones
     // attempted to be found.
+  
     int len = strlen(source);
     
-    if (vm->repl || len < 4 ) {
+    if (vm->repl || len < 4 || source[len - 4] != '.') {
         source = "";
     }
-
     char res[PATH_MAX];
+    
     if (!resolvePath(".", source, res)) {
         runtimeError(vm, "Unable to resolve path '%s'", source);
         exit(1);
@@ -107,7 +108,6 @@ ObjString *getDirectory(DictuVM *vm, char *source) {
     if (vm->repl) {
         return copyString(vm, res, strlen(res));
     }
-
     return dirname(vm, res, strlen(res));
 }
 

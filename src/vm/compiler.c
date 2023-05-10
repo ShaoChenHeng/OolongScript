@@ -7,6 +7,7 @@
 #include "memory.h"
 #include "vm.h"
 #include "error.h"
+#include "optionals.h"
 
 #ifdef DEBUG_PRINT_CODE
 
@@ -60,7 +61,11 @@ static void advance(Parser *parser) {
   }
 }
 
-
+static void recede(Parser *parser){
+    for (int i = 0; i < parser->current.length; ++i) {
+            backTrack(&parser->scanner);
+    }
+}
 static void consume(Compiler *compiler, TokenType type, const char *message) {
   if (compiler->parser->current.type == type) {
     advance(compiler->parser);
@@ -528,6 +533,15 @@ static bool foldBinary(Compiler *compiler, TokenType operatorType) {
     FOLD(/);
     return false;
   }
+  case TOKEN_PERCENT: {
+    FOLD_FUNC(fmod);
+    return false;
+  }
+
+  case TOKEN_STAR_STAR: {
+    FOLD_FUNC(powf);
+    return false;
+  }
   default: {
     return false;
   }
@@ -676,6 +690,14 @@ static void dot(Compiler *compiler, Token previousToken, bool canAssign) {
       emitBytes(compiler, OP_GET_PROPERTY, name);
     }
   }
+}
+
+static void chain(Compiler *compiler, Token previousToken, bool canAssign) {
+    // If the operand is not nil we want to stop, otherwise continue
+    int endJump = emitJump(compiler, OP_JUMP_IF_NIL);
+    dot(compiler, previousToken, canAssign);
+
+    patchJump(compiler, endJump);
 }
 
 static void literal(Compiler *compiler, bool canAssign) {
@@ -924,6 +946,88 @@ static Value parseString(Compiler *compiler, bool canAssign) {
 
 static void string(Compiler *compiler, bool canAssign) {
   emitConstant(compiler, parseString(compiler, canAssign));
+}
+
+static void list(Compiler *compiler, bool canAssign) {
+    UNUSED(canAssign);
+
+    int count = 0;
+
+    do {
+        if (check(compiler, TOKEN_RIGHT_BRACKET))
+            break;
+
+        expression(compiler);
+        count++;
+    } while (match(compiler, TOKEN_COMMA));
+
+    emitBytes(compiler, OP_NEW_LIST, count);
+    consume(compiler, TOKEN_RIGHT_BRACKET, "Expected closing ']'");
+}
+
+static void subscript(Compiler *compiler, Token previousToken, bool canAssign) {
+    UNUSED(previousToken);
+    // slice with no initial index [1, 2, 3][:100]
+    if (match(compiler, TOKEN_COLON)) {
+        emitByte(compiler, OP_EMPTY);
+        expression(compiler);
+        emitByte(compiler, OP_SLICE);
+        consume(compiler, TOKEN_RIGHT_BRACKET, "Expected closing ']'");
+        return;
+    }
+
+    expression(compiler);
+
+    if (match(compiler, TOKEN_COLON)) {
+        // If we slice with no "ending" push EMPTY so we know
+        // To go to the end of the iterable
+        // i.e [1, 2, 3][1:]
+        if (check(compiler, TOKEN_RIGHT_BRACKET)) {
+            emitByte(compiler, OP_EMPTY);
+        } else {
+            expression(compiler);
+        }
+        emitByte(compiler, OP_SLICE);
+        consume(compiler, TOKEN_RIGHT_BRACKET, "Expected closing ']'");
+        return;
+    }
+
+    consume(compiler, TOKEN_RIGHT_BRACKET, "Expected closing ']'");
+
+    if (canAssign && match(compiler, TOKEN_EQUAL)) {
+        expression(compiler);
+        emitByte(compiler, OP_SUBSCRIPT_ASSIGN);
+    } else if (canAssign && match(compiler, TOKEN_PLUS_EQUALS)) {
+        expression(compiler);
+        emitBytes(compiler, OP_SUBSCRIPT_PUSH, OP_ADD);
+        emitByte(compiler, OP_SUBSCRIPT_ASSIGN);
+    } else if (canAssign && match(compiler, TOKEN_MINUS_EQUALS)) {
+        expression(compiler);
+        emitBytes(compiler, OP_SUBSCRIPT_PUSH, OP_SUBTRACT);
+        emitByte(compiler, OP_SUBSCRIPT_ASSIGN);
+    } else if (canAssign && match(compiler, TOKEN_MULTIPLY_EQUALS)) {
+        expression(compiler);
+        emitBytes(compiler, OP_SUBSCRIPT_PUSH, OP_MULTIPLY);
+        emitByte(compiler, OP_SUBSCRIPT_ASSIGN);
+    } else if (canAssign && match(compiler, TOKEN_DIVIDE_EQUALS)) {
+        expression(compiler);
+        emitBytes(compiler, OP_SUBSCRIPT_PUSH, OP_DIVIDE);
+        emitByte(compiler, OP_SUBSCRIPT_ASSIGN);
+    } else if (canAssign && match(compiler, TOKEN_AMPERSAND_EQUALS)) {
+        expression(compiler);
+        emitBytes(compiler, OP_SUBSCRIPT_PUSH, OP_BITWISE_AND);
+        emitByte(compiler, OP_SUBSCRIPT_ASSIGN);
+    } else if (canAssign && match(compiler, TOKEN_CARET_EQUALS)) {
+        expression(compiler);
+        emitBytes(compiler, OP_SUBSCRIPT_PUSH, OP_BITWISE_XOR);
+        emitByte(compiler, OP_SUBSCRIPT_ASSIGN);
+    } else if (canAssign && match(compiler, TOKEN_PIPE_EQUALS)) {
+        expression(compiler);
+        emitBytes(compiler, OP_SUBSCRIPT_PUSH, OP_BITWISE_OR);
+        emitByte(compiler, OP_SUBSCRIPT_ASSIGN);
+    } else {
+        emitByte(compiler, OP_SUBSCRIPT);
+    }
 }
 
 static void checkConst(Compiler *compiler, uint8_t setOp, int arg) {
@@ -1256,6 +1360,9 @@ ParseRule rules[] = {
   [TOKEN_FROM]          = {NULL,     NULL,   PREC_NONE},
   [TOKEN_PERCENT]       = {NULL,     binary, PREC_FACTOR},
   [TOKEN_STAR_STAR]     = {NULL,     binary, PREC_INDICES},
+  [TOKEN_LEFT_BRACKET]  = {list,     subscript, PREC_CALL},
+  [TOKEN_RIGHT_BRACKET] = {NULL,     NULL,      PREC_NONE},
+  [TOKEN_COLON]         = {NULL,     NULL,      PREC_NONE},
  
 };
 
@@ -1434,26 +1541,52 @@ static void funDeclaration(Compiler *compiler) {
 }
 
 static void varDeclaration(Compiler *compiler, bool constant) {
-  
-  do {
-    uint8_t global = parseVariable(compiler, "Expect variable name.", constant);
+  if (match(compiler, TOKEN_LEFT_BRACKET)) {
+    Token variables[255];
+    int varCount = 0;
 
-    if (match(compiler, TOKEN_EQUAL) || constant) {
-      
-      // Compile the initializer.
-      expression(compiler);
+    do {
+      consume(compiler, TOKEN_IDENTIFIER, "Expect variable name.");
+      variables[varCount] = compiler->parser->previous;
+      varCount++;
+    } while (match(compiler, TOKEN_COMMA));
+
+    consume(compiler, TOKEN_RIGHT_BRACKET, "Expect ']' after list destructure.");
+    consume(compiler, TOKEN_EQUAL, "Expect '=' after list destructure.");
+
+    expression(compiler);
+
+    emitBytes(compiler, OP_UNPACK_LIST, varCount);
+
+    if (compiler->scopeDepth == 0) {
+      for (int i = varCount - 1; i >= 0; --i) {
+        uint8_t identifier = identifierConstant(compiler, &variables[i]);
+        defineVariable(compiler, identifier, constant);
+      }
     } else {
-      // Default to nil.
-      emitByte(compiler, OP_NIL);
+      for (int i = 0; i < varCount; ++i) {
+        declareVariable(compiler, &variables[i]);
+        defineVariable(compiler, 0, constant);
+      }
     }
+  } else {
+    do {
+      uint8_t global = parseVariable(compiler, "Expect variable name.", constant);
 
-    defineVariable(compiler, global, constant);
-  } while (match(compiler, TOKEN_COMMA));
-  
+      if (match(compiler, TOKEN_EQUAL) || constant) {
+        // Compile the initializer.
+        expression(compiler);
+      } else {
+        // Default to nil.
+        emitByte(compiler, OP_NIL);
+      }
+
+      defineVariable(compiler, global, constant);
+    } while (match(compiler, TOKEN_COMMA));
+  }
 
   consume(compiler, TOKEN_SEMICOLON, "Expect ';' after variable declaration.");
 }
-
 
 static void expressionStatement(Compiler *compiler) {
   Token previous = compiler->parser->previous;
@@ -1486,8 +1619,6 @@ static int getArgCount(uint8_t *code, const ValueArray constants, int ip) {
   case OP_ADD:
   case OP_MULTIPLY:
   case OP_NOT:
-  case OP_POW:
-  case OP_MOD:
   case OP_NEGATE:
   case OP_CLOSE_UPVALUE:
   case OP_RETURN:
@@ -1496,6 +1627,8 @@ static int getArgCount(uint8_t *code, const ValueArray constants, int ip) {
   case OP_IMPORT_VARIABLE:
   case OP_IMPORT_END:
   case OP_BREAK:
+  case OP_POW:
+  case OP_MOD:
   case OP_BITWISE_AND:
   case OP_BITWISE_XOR:
   case OP_BITWISE_OR:
@@ -1518,22 +1651,23 @@ static int getArgCount(uint8_t *code, const ValueArray constants, int ip) {
   case OP_IMPORT:
   case OP_DEFINE_OPTIONAL:
   case OP_JUMP:
+  case OP_JUMP_IF_NIL:
   case OP_JUMP_IF_FALSE:
   case OP_LOOP:
   case OP_CLASS:
+  case OP_SUBCLASS:
+  case OP_IMPORT_BUILTIN:
   case OP_CALL:
     return 2;
-
   case OP_INVOKE:
   case OP_SUPER:
     return 3;
 
-    /*case OP_IMPORT_BUILTIN_VARIABLE: {
+  case OP_IMPORT_BUILTIN_VARIABLE: {
     int argCount = code[ip + 2];
-
     return 2 + argCount;
   }
-    */
+  
 
   case OP_CLOSURE: {
     int constant = code[ip + 1];
@@ -1731,77 +1865,159 @@ static void returnStatement(Compiler *compiler) {
   }
 }
 
-
 static void importStatement(Compiler *compiler) {
   if (match(compiler, TOKEN_STRING)) {
-    int importConstant = makeConstant(compiler, OBJ_VAL(copyString(
-								   compiler->parser->vm,
-								   compiler->parser->previous.start + 1,
-								   compiler->parser->previous.length - 2)));
+    int importConstant =
+      makeConstant(compiler,
+                   OBJ_VAL(copyString(
+                   compiler->parser->vm,
+                   compiler->parser->previous.start + 1,
+                   compiler->parser->previous.length - 2)));
 
     emitBytes(compiler, OP_IMPORT, importConstant);
     emitByte(compiler, OP_POP);
 
     if (match(compiler, TOKEN_AS)) {
-      uint8_t importName = parseVariable(compiler, "Expect import alias.", false);
+      uint8_t importName = parseVariable(compiler,
+                                         "Expect import alias.", false);
       emitByte(compiler, OP_IMPORT_VARIABLE);
       defineVariable(compiler, importName, false);
     }
+  } else {
+    consume(compiler, TOKEN_IDENTIFIER,
+            "Expect import identifier.");
+    uint8_t importName = identifierConstant(compiler,
+                                            &compiler->parser->previous);
+    declareVariable(compiler, &compiler->parser->previous);
+
+    bool dictuSource = false;
+
+    int index = findBuiltinModule((char *) compiler->parser->previous.start,
+                                  compiler->parser->previous.length -
+                                  compiler->parser->current.length,
+                                  &dictuSource
+                                  );
+
+    if (index == -1) {
+      error(compiler->parser, "Unknown module");
+    }
+
+    emitBytes(compiler, OP_IMPORT_BUILTIN, index);
+    emitByte(compiler, importName);
+
+    if (dictuSource) {
+      emitByte(compiler, OP_POP);
+      emitByte(compiler, OP_IMPORT_VARIABLE);
+    }
+
+    defineVariable(compiler, importName, false);
   }
 
   emitByte(compiler, OP_IMPORT_END);
   consume(compiler, TOKEN_SEMICOLON, "Expect ';' after import.");
 }
-
 static void fromImportStatement(Compiler *compiler) {
-  if (match(compiler, TOKEN_STRING)) {
-    int importConstant = makeConstant(compiler, OBJ_VAL(copyString(
-								   compiler->parser->vm,
-								   compiler->parser->previous.start + 1,
-								   compiler->parser->previous.length - 2)));
+    if (match(compiler, TOKEN_STRING)) {
+        int importConstant = makeConstant(compiler, OBJ_VAL(copyString(
+                compiler->parser->vm,
+                compiler->parser->previous.start + 1,
+                compiler->parser->previous.length - 2)));
 
-    consume(compiler, TOKEN_IMPORT, "Expect 'import' after import path.");
-    emitBytes(compiler, OP_IMPORT, importConstant);
-    emitByte(compiler, OP_POP);
+        consume(compiler, TOKEN_IMPORT, "Expect 'import' after import path.");
+        emitBytes(compiler, OP_IMPORT, importConstant);
+        emitByte(compiler, OP_POP);
 
-    uint8_t variables[255];
-    Token tokens[255];
-    int varCount = 0;
+        uint8_t variables[255];
+        Token tokens[255];
+        int varCount = 0;
 
-    do {
-      consume(compiler, TOKEN_IDENTIFIER, "Expect variable name.");
-      tokens[varCount] = compiler->parser->previous;
-      variables[varCount] = identifierConstant(compiler, &compiler->parser->previous);
-      varCount++;
+        do {
+            consume(compiler, TOKEN_IDENTIFIER, "Expect variable name.");
+            tokens[varCount] = compiler->parser->previous;
+            variables[varCount] = identifierConstant(compiler, &compiler->parser->previous);
+            varCount++;
 
-      if (varCount > 255) {
-        error(compiler->parser, "Cannot have more than 255 variables.");
-      }
-    } while (match(compiler, TOKEN_COMMA));
+            if (varCount > 255) {
+                error(compiler->parser, "Cannot have more than 255 variables.");
+            }
+        } while (match(compiler, TOKEN_COMMA));
 
-    emitBytes(compiler, OP_IMPORT_FROM, varCount);
+        emitBytes(compiler, OP_IMPORT_FROM, varCount);
 
-    for (int i = 0; i < varCount; ++i) {
-      emitByte(compiler, variables[i]);
-    }
+        for (int i = 0; i < varCount; ++i) {
+            emitByte(compiler, variables[i]);
+        }
 
-    // This needs to be two separate loops as we need
-    // all the variables popped before defining.
-    if (compiler->scopeDepth == 0) {
-      for (int i = varCount - 1; i >= 0; --i) {
-        defineVariable(compiler, variables[i], false);
-      }
+        // This needs to be two separate loops as we need
+        // all the variables popped before defining.
+        if (compiler->scopeDepth == 0) {
+            for (int i = varCount - 1; i >= 0; --i) {
+                defineVariable(compiler, variables[i], false);
+            }
+        } else {
+            for (int i = 0; i < varCount; ++i) {
+                declareVariable(compiler, &tokens[i]);
+                defineVariable(compiler, 0, false);
+            }
+        }
     } else {
-      for (int i = 0; i < varCount; ++i) {
-        declareVariable(compiler, &tokens[i]);
-        defineVariable(compiler, 0, false);
-      }
-    }
-   
-  }
+        consume(compiler, TOKEN_IDENTIFIER, "Expect import identifier.");
+        uint8_t importName = identifierConstant(compiler, &compiler->parser->previous);
 
-  emitByte(compiler, OP_IMPORT_END);
-  consume(compiler, TOKEN_SEMICOLON, "Expect ';' after import.");
+        bool dictuSource;
+
+        int index = findBuiltinModule(
+                (char *) compiler->parser->previous.start,
+                compiler->parser->previous.length,
+                &dictuSource
+        );
+
+        consume(compiler, TOKEN_IMPORT, "Expect 'import' after identifier");
+
+        if (index == -1) {
+            error(compiler->parser, "Unknown module");
+        }
+
+        uint8_t variables[255];
+        Token tokens[255];
+        int varCount = 0;
+
+        do {
+            consume(compiler, TOKEN_IDENTIFIER, "Expect variable name.");
+            tokens[varCount] = compiler->parser->previous;
+            variables[varCount] = identifierConstant(compiler, &compiler->parser->previous);
+            varCount++;
+
+            if (varCount > 255) {
+                error(compiler->parser, "Cannot have more than 255 variables.");
+            }
+        } while (match(compiler, TOKEN_COMMA));
+
+        emitBytes(compiler, OP_IMPORT_BUILTIN, index);
+        emitByte(compiler, importName);
+        emitByte(compiler, OP_POP);
+
+        emitByte(compiler, OP_IMPORT_BUILTIN_VARIABLE);
+        emitBytes(compiler, importName, varCount);
+
+        for (int i = 0; i < varCount; ++i) {
+            emitByte(compiler, variables[i]);
+        }
+
+        if (compiler->scopeDepth == 0) {
+            for (int i = varCount - 1; i >= 0; --i) {
+                defineVariable(compiler, variables[i], false);
+            }
+        } else {
+            for (int i = 0; i < varCount; ++i) {
+                declareVariable(compiler, &tokens[i]);
+                defineVariable(compiler, 0, false);
+            }
+        }
+    }
+
+    emitByte(compiler, OP_IMPORT_END);
+    consume(compiler, TOKEN_SEMICOLON, "Expect ';' after import.");
 }
 
 static void whileStatement(Compiler *compiler) {
@@ -1832,6 +2048,70 @@ static void whileStatement(Compiler *compiler) {
     endLoop(compiler);
 }
 
+static void unpackListStatement(Compiler *compiler){
+    int varCount = 0;
+    Token variables[255];
+    Token previous=compiler->parser->previous;
+    do {
+        if(!check(compiler,TOKEN_IDENTIFIER)){
+            if(varCount>0){
+                recede(compiler->parser);
+            }
+            int varsAndCommas=varCount+(varCount-1);
+            for(int var=0;var<varsAndCommas;var++){
+                recede(compiler->parser);
+            }
+            recede(compiler->parser);
+            compiler->parser->current=previous;
+            expressionStatement(compiler);
+            return;
+        }
+        consume(compiler, TOKEN_IDENTIFIER, "Expect variable name.");
+        variables[varCount] = compiler->parser->previous;
+        varCount++;
+    } while (match(compiler, TOKEN_COMMA));
+
+    consume(compiler, TOKEN_RIGHT_BRACKET, "Expect ']' after list destructure.");
+
+    if(!check(compiler, TOKEN_EQUAL)){
+        recede(compiler->parser);
+        int varsAndCommas=varCount+(varCount-1);
+        for(int var=0;var<varsAndCommas;var++){
+                recede(compiler->parser);
+        }
+        recede(compiler->parser);
+        compiler->parser->current=previous;
+        expressionStatement(compiler);
+        return;
+    }
+
+    consume(compiler, TOKEN_EQUAL, "Expect '=' after list destructure.");
+
+    expression(compiler);
+
+    emitBytes(compiler, OP_UNPACK_LIST, varCount);
+
+
+    for(int i=varCount-1;i>-1;i--){
+        Token token=variables[i];
+    
+        uint8_t setOp;
+        int arg = resolveLocal(compiler, &token, false);
+        if (arg != -1) {
+                setOp = OP_SET_LOCAL;
+        } else if ((arg = resolveUpvalue(compiler, &token)) != -1) {
+                setOp = OP_SET_UPVALUE;
+        } else {
+                arg = identifierConstant(compiler, &token);
+                setOp = OP_SET_MODULE;
+        }
+        checkConst(compiler, setOp, arg);
+        emitBytes(compiler, setOp, (uint8_t) arg);
+        emitByte(compiler, OP_POP);
+    }
+
+    consume(compiler, TOKEN_SEMICOLON, "Expect ';' after variable declaration.");
+}
 
 static void synchronize(Parser *parser) {
   parser->panicMode = false;
@@ -1889,6 +2169,8 @@ static void statement(Compiler *compiler) {
     fromImportStatement(compiler);
   } else if (match(compiler, TOKEN_BREAK)) {
     breakStatement(compiler);
+  } else if (match(compiler, TOKEN_LEFT_BRACKET)) {
+    unpackListStatement(compiler);
   } else if (match(compiler, TOKEN_WHILE)) {
     whileStatement(compiler);
   } else if (match(compiler, TOKEN_LEFT_BRACE)) {
@@ -1909,6 +2191,16 @@ static void statement(Compiler *compiler) {
         return;
       }
     }
+
+    if (check(compiler, TOKEN_COLON)) {
+            for (int i = 0; i < parser->current.length + parser->previous.length; ++i) {
+                backTrack(&parser->scanner);
+            }
+
+            parser->current = previous;
+            expressionStatement(compiler);
+            return;
+        }
 
     // Reset the scanner to the previous position
     for (int i = 0; i < parser->current.length; ++i) {

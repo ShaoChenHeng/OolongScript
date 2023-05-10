@@ -1,5 +1,5 @@
-#ifndef oolong_object_h
-#define oolong_object_h
+#ifndef dictu_object_h
+#define dictu_object_h
 
 #include <stdint.h>
 #include <stdio.h>

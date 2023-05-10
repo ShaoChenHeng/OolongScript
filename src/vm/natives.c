@@ -5,7 +5,7 @@
 #include "memory.h"
 #include "natives.h"
 #include "vm.h"
-
+#include "optionals.h"
 
 // Native functions
 static Value typeNative(DictuVM *vm, int argCount, Value *args) {
@@ -128,7 +128,34 @@ static Value assertNative(DictuVM *vm, int argCount, Value *args) {
     return NIL_VAL;
 }
 
+static Value isDefinedNative(DictuVM *vm, int argCount, Value *args) {
+    if (argCount != 1) {
+        runtimeError(vm, "isDefined() takes 1 argument (%d given).", argCount);
+        return EMPTY_VAL;
+    }
 
+    if (!IS_STRING(args[0])) {
+        runtimeError(vm, "isDefined() only takes a string as an argument");
+        return EMPTY_VAL;
+    }
+
+    ObjString *string = AS_STRING(args[0]);
+
+    Value value;
+    CallFrame *frame = &vm->frames[vm->frameCount - 1];
+    if (tableGet(&frame->closure->function->module->values, string, &value))
+       return TRUE_VAL;
+
+    if (tableGet(&vm->globals, string, &value))
+        return TRUE_VAL;
+
+    bool _;
+
+    if (findBuiltinModule(string->chars, string->length, &_) != -1)
+        return TRUE_VAL;    
+
+    return FALSE_VAL;
+}
 
 static Value generateSuccessResult(DictuVM *vm, int argCount, Value *args) {
     if (argCount != 1) {
@@ -175,6 +202,7 @@ void defineAllNatives(DictuVM *vm) {
             printNative,
             printErrorNative,
             assertNative,
+            isDefinedNative,
             generateSuccessResult,
             generateErrorResult
     };

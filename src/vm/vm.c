@@ -14,6 +14,8 @@
 #include "error.h"
 #include "natives.h"
 #include "strings.h"
+#include "lists.h"
+#include "optionals.h"
 
 static void resetStack(DictuVM *vm) {
   vm->stackTop = vm->stack;
@@ -67,7 +69,7 @@ void runtimeError(DictuVM *vm, const char *format, ...) {
 
   resetStack(vm);
 }
-
+int count = 0;
 DictuVM *dictuInitVM(bool repl, int argc, char **argv) {
   DictuVM *vm = malloc(sizeof(*vm));
 
@@ -116,6 +118,7 @@ DictuVM *dictuInitVM(bool repl, int argc, char **argv) {
   defineAllNatives(vm);
   // Native methods
   declareStringMethods(vm);
+  declareListMethods(vm);
   
   /*
   // Native methods
@@ -136,7 +139,7 @@ DictuVM *dictuInitVM(bool repl, int argc, char **argv) {
    * Native classes which are not required to be
    * imported. For imported modules see optionals.c
    */
-  // createCModule(vm);
+  //createCModule(vm);
 
   if (vm->repl) {
     vm->replVar = copyString(vm, "_", 1);
@@ -533,7 +536,26 @@ static bool invoke(DictuVM *vm, ObjString *name, int argCount, bool unpack) {
         runtimeError(vm, "String has no method %s().", name->chars);
         return false;
       }
-      
+
+      case OBJ_LIST: {
+        Value value;
+        if (tableGet(&vm->listMethods, name, &value)) {
+          if (IS_NATIVE(value)) {
+            return callNativeMethod(vm, value, argCount);
+          }
+
+          push(vm, peek(vm, 0));
+
+          for (int i = 2; i <= argCount + 1; i++) {
+            vm->stackTop[-i] = peek(vm, i);
+          }
+
+          return call(vm, AS_CLOSURE(value), argCount + 1);
+        }
+
+        runtimeError(vm, "List has no method %s().", name->chars);
+        return false;
+      }
 
       default:
         break;
@@ -543,7 +565,6 @@ static bool invoke(DictuVM *vm, ObjString *name, int argCount, bool unpack) {
   runtimeError(vm, "Only instances have methods.");
   return false;
 }
-
 
 
 static bool bindMethod(DictuVM *vm, ObjClass *klass, ObjString *name) {
@@ -1162,6 +1183,16 @@ static DictuInterpretResult run(DictuVM *vm) {
     CASE_CODE(DIVIDE):
       BINARY_OP(NUMBER_VAL, /, double);
       DISPATCH();
+
+    CASE_CODE(POW): {
+        BINARY_OP_FUNCTION(NUMBER_VAL, **, powf, double);
+        DISPATCH();
+      }
+
+    CASE_CODE(MOD): {
+        BINARY_OP_FUNCTION(NUMBER_VAL, **, fmod, double);
+        DISPATCH();
+      }
       
     CASE_CODE(BITWISE_AND):
       BINARY_OP(NUMBER_VAL, &, int);
@@ -1195,6 +1226,11 @@ static DictuInterpretResult run(DictuVM *vm) {
     CASE_CODE(JUMP_IF_FALSE): {
         uint16_t offset = READ_SHORT();
         if (isFalsey(peek(vm, 0))) ip += offset;
+        DISPATCH();
+      }
+    CASE_CODE(JUMP_IF_NIL): {
+        uint16_t offset = READ_SHORT();
+        if (IS_NIL(peek(vm, 0))) ip += offset;
         DISPATCH();
       }
     CASE_CODE(LOOP): {
@@ -1256,6 +1292,66 @@ static DictuInterpretResult run(DictuVM *vm) {
 
         DISPATCH();
       }
+    CASE_CODE(IMPORT_BUILTIN): {
+        int index = READ_BYTE();
+        ObjString *fileName = READ_STRING();
+        Value moduleVal;
+
+        // If we have imported this module already, skip.
+        if (tableGet(&vm->modules, fileName, &moduleVal)) {
+          vm->lastModule = AS_MODULE(moduleVal);
+          push(vm, moduleVal);
+          DISPATCH();
+        }
+
+        Value module = importBuiltinModule(vm, index);
+
+        if (IS_EMPTY(module)) {
+          return INTERPRET_COMPILE_ERROR;
+        }
+
+        push(vm, module);
+
+        if (IS_CLOSURE(module)) {
+          frame->ip = ip;
+          call(vm, AS_CLOSURE(module), 0);
+          frame = &vm->frames[vm->frameCount - 1];
+          ip = frame->ip;
+
+          tableGet(&vm->modules, fileName, &module);
+          vm->lastModule = AS_MODULE(module);
+        }
+
+        DISPATCH();
+      }
+
+    CASE_CODE(IMPORT_BUILTIN_VARIABLE): {
+        ObjString *fileName = READ_STRING();
+        int varCount = READ_BYTE();
+
+        Value moduleVal;
+        ObjModule *module;
+
+        if (tableGet(&vm->modules, fileName, &moduleVal)) {
+          module = AS_MODULE(moduleVal);
+        } else {
+          RUNTIME_ERROR("ERROR!!");
+        }
+
+        for (int i = 0; i < varCount; i++) {
+          Value moduleVariable;
+          ObjString *variable = READ_STRING();
+
+          if (!tableGet(&module->values, variable, &moduleVariable)) {
+            RUNTIME_ERROR("%s can't be found in module %s", variable->chars, module->name->chars);
+          }
+
+          push(vm, moduleVariable);
+        }
+
+        DISPATCH();
+      }
+
     CASE_CODE(IMPORT_VARIABLE): {
         push(vm, OBJ_VAL(vm->lastModule));
         DISPATCH();
@@ -1282,6 +1378,285 @@ static DictuInterpretResult run(DictuVM *vm) {
         vm->lastModule = frame->closure->function->module;
         DISPATCH();
       }
+
+    CASE_CODE(NEW_LIST): {
+        int count = READ_BYTE();
+        ObjList *list = newList(vm);
+        push(vm, OBJ_VAL(list));
+
+        for (int i = count; i > 0; i--) {
+          writeValueArray(vm, &list->values, peek(vm, i));
+        }
+
+        vm->stackTop -= count + 1;
+        push(vm, OBJ_VAL(list));
+        DISPATCH();
+      }
+
+    CASE_CODE(UNPACK_LIST): {
+        int varCount = READ_BYTE();
+
+        if (!IS_LIST(peek(vm, 0))) {
+          RUNTIME_ERROR("Attempting to unpack a value which is not a list.");
+        }
+
+        ObjList *list = AS_LIST(pop(vm));
+
+        if (varCount != list->values.count) {
+          if (varCount < list->values.count) {
+            RUNTIME_ERROR("Too many values to unpack");
+          } else {
+            RUNTIME_ERROR("Not enough values to unpack");
+          }
+        }
+
+        for (int i = 0; i < list->values.count; ++i) {
+          push(vm, list->values.values[i]);
+        }
+
+        DISPATCH();
+      }
+    
+    CASE_CODE(SUBSCRIPT): {
+        Value indexValue = peek(vm, 0);
+        Value subscriptValue = peek(vm, 1);
+
+        if (!IS_OBJ(subscriptValue)) {
+          RUNTIME_ERROR_TYPE("'%s' is not subscriptable", 1);
+        }
+
+        switch (getObjType(subscriptValue)) {
+        case OBJ_LIST: {
+          if (!IS_NUMBER(indexValue)) {
+            RUNTIME_ERROR("List index must be a number.");
+          }
+
+          ObjList *list = AS_LIST(subscriptValue);
+          int index = AS_NUMBER(indexValue);
+
+          // Allow negative indexes
+          if (index < 0)
+            index = list->values.count + index;
+
+          if (index >= 0 && index < list->values.count) {
+            pop(vm);
+            pop(vm);
+            push(vm, list->values.values[index]);
+            DISPATCH();
+          }
+
+          RUNTIME_ERROR("List index out of bounds.");
+        }
+
+        case OBJ_STRING: {
+          ObjString *string = AS_STRING(subscriptValue);
+          int index = AS_NUMBER(indexValue);
+
+          // Allow negative indexes
+          if (index < 0)
+            index = string->length + index;
+
+          if (index >= 0 && index < string->length) {
+            pop(vm);
+            pop(vm);
+            push(vm, OBJ_VAL(copyString(vm, &string->chars[index], 1)));
+            DISPATCH();
+          }
+
+          RUNTIME_ERROR("String index out of bounds.");
+        }
+
+        case OBJ_DICT: {
+          ObjDict *dict = AS_DICT(subscriptValue);
+          if (!isValidKey(indexValue)) {
+            RUNTIME_ERROR("Dictionary key must be an immutable type.");
+          }
+
+          Value v;
+          pop(vm);
+          pop(vm);
+          if (dictGet(dict, indexValue, &v)) {
+            push(vm, v);
+            DISPATCH();
+          }
+
+          RUNTIME_ERROR("Key %s does not exist within dictionary.", valueToString(indexValue));
+        }
+
+        default: {
+          RUNTIME_ERROR_TYPE("'%s' is not subscriptable", 1);
+        }
+        }
+      }
+        
+      
+      CASE_CODE(SUBSCRIPT_ASSIGN): {
+          Value assignValue = peek(vm, 0);
+          Value indexValue = peek(vm, 1);
+          Value subscriptValue = peek(vm, 2);
+
+          if (!IS_OBJ(subscriptValue)) {
+            RUNTIME_ERROR_TYPE("'%s' does not support item assignment", 2);
+          }
+
+          switch (getObjType(subscriptValue)) {
+          case OBJ_LIST: {
+            if (!IS_NUMBER(indexValue)) {
+              RUNTIME_ERROR("List index must be a number.");
+            }
+
+            ObjList *list = AS_LIST(subscriptValue);
+            int index = AS_NUMBER(indexValue);
+
+            if (index < 0)
+              index = list->values.count + index;
+
+            if (index >= 0 && index < list->values.count) {
+              list->values.values[index] = assignValue;
+              pop(vm);
+              pop(vm);
+              pop(vm);
+              push(vm, NIL_VAL);
+              DISPATCH();
+            }
+
+            RUNTIME_ERROR("List index out of bounds.");
+          }
+
+          default: {
+            RUNTIME_ERROR_TYPE("'%s' does not support item assignment", 2);
+          }
+          }
+        }
+    CASE_CODE(SUBSCRIPT_PUSH): {
+        Value value = peek(vm, 0);
+        Value indexValue = peek(vm, 1);
+        Value subscriptValue = peek(vm, 2);
+
+        if (!IS_OBJ(subscriptValue)) {
+          RUNTIME_ERROR_TYPE("'%s' does not support item assignment", 2);
+        }
+
+        switch (getObjType(subscriptValue)) {
+        case OBJ_LIST: {
+          if (!IS_NUMBER(indexValue)) {
+            RUNTIME_ERROR("List index must be a number.");
+          }
+
+          ObjList *list = AS_LIST(subscriptValue);
+          int index = AS_NUMBER(indexValue);
+
+          // Allow negative indexes
+          if (index < 0)
+            index = list->values.count + index;
+
+          if (index >= 0 && index < list->values.count) {
+            vm->stackTop[-1] = list->values.values[index];
+            push(vm, value);
+            DISPATCH();
+          }
+
+          RUNTIME_ERROR("List index out of bounds.");
+        }
+
+        default: {
+          RUNTIME_ERROR_TYPE("'%s' does not support item assignment", 2);
+        }
+        }
+        DISPATCH();
+      }
+    CASE_CODE(SLICE): {
+        Value sliceEndIndex = peek(vm, 0);
+        Value sliceStartIndex = peek(vm, 1);
+        Value objectValue = peek(vm, 2);
+
+        if (!IS_OBJ(objectValue)) {
+          RUNTIME_ERROR("Can only slice on lists and strings.");
+        }
+
+        if ((!IS_NUMBER(sliceStartIndex) && !IS_EMPTY(sliceStartIndex)) || (!IS_NUMBER(sliceEndIndex) && !IS_EMPTY(sliceEndIndex))) {
+          RUNTIME_ERROR("Slice index must be a number.");
+        }
+
+        int indexStart;
+        int indexEnd;
+        Value returnVal;
+
+        if (IS_EMPTY(sliceStartIndex)) {
+          indexStart = 0;
+        } else {
+          indexStart = AS_NUMBER(sliceStartIndex);
+
+          if (indexStart < 0) {
+            indexStart = 0;
+          }
+        }
+
+        switch (getObjType(objectValue)) {
+        case OBJ_LIST: {
+          ObjList *createdList = newList(vm);
+          push(vm, OBJ_VAL(createdList));
+          ObjList *list = AS_LIST(objectValue);
+
+          if (IS_EMPTY(sliceEndIndex)) {
+            indexEnd = list->values.count;
+          } else {
+            indexEnd = AS_NUMBER(sliceEndIndex);
+
+            if (indexEnd > list->values.count) {
+              indexEnd = list->values.count;
+            } else if (indexEnd < 0) {
+              indexEnd = list->values.count + indexEnd;
+            }
+          }
+
+          for (int i = indexStart; i < indexEnd; i++) {
+            writeValueArray(vm, &createdList->values, list->values.values[i]);
+          }
+
+          pop(vm);
+          returnVal = OBJ_VAL(createdList);
+
+          break;
+        }
+
+        case OBJ_STRING: {
+          ObjString *string = AS_STRING(objectValue);
+
+          if (IS_EMPTY(sliceEndIndex)) {
+            indexEnd = string->length;
+          } else {
+            indexEnd = AS_NUMBER(sliceEndIndex);
+
+            if (indexEnd > string->length) {
+              indexEnd = string->length;
+            }  else if (indexEnd < 0) {
+              indexEnd = string->length + indexEnd;
+            }
+          }
+
+          // Ensure the start index is below the end index
+          if (indexStart > indexEnd) {
+            returnVal = OBJ_VAL(copyString(vm, "", 0));
+          } else {
+            returnVal = OBJ_VAL(copyString(vm, string->chars + indexStart, indexEnd - indexStart));
+          }
+          break;
+        }
+
+        default: {
+          RUNTIME_ERROR_TYPE("'%s' does not support item assignment", 2);
+        }
+        }
+
+        pop(vm);
+        pop(vm);
+        pop(vm);
+
+        push(vm, returnVal);
+        DISPATCH();
+      }
+
     CASE_CODE(CALL): {
         int argCount = READ_BYTE();
         bool unpack = READ_BYTE();
@@ -1446,16 +1821,18 @@ static DictuInterpretResult run(DictuVM *vm) {
     
 }
 
+
 DictuInterpretResult dictuInterpret(DictuVM *vm, char *moduleName, char *source) {
+  
   ObjString *name = copyString(vm, moduleName, strlen(moduleName));
   push(vm, OBJ_VAL(name));
   ObjModule *module = newModule(vm, name);
   pop(vm);
-
+  
   push(vm, OBJ_VAL(module));
   module->path = getDirectory(vm, moduleName);
   pop(vm);
-
+  
   ObjFunction *function = compile(vm, module, source);
   if (function == NULL) return INTERPRET_COMPILE_ERROR;
   push(vm, OBJ_VAL(function));
@@ -1464,6 +1841,6 @@ DictuInterpretResult dictuInterpret(DictuVM *vm, char *moduleName, char *source)
   push(vm, OBJ_VAL(closure));
   callValue(vm, OBJ_VAL(closure), 0, false);
   DictuInterpretResult result = run(vm);
-
+  
   return result;
 }
